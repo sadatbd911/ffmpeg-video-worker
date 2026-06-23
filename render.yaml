@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: ffmpeg-video-worker
+    env: node
+    plan: free
+    buildCommand: |
+      apt-get update && apt-get install -y ffmpeg && npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
