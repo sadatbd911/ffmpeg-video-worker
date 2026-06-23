@@ -5,6 +5,7 @@ const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
+const { execSync } = require('child_process');
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
@@ -29,23 +30,19 @@ app.post('/assemble-video', async (req, res) => {
 
   const { story_id, title, scene_duration = 5 } = req.body;
 
-  // Handle audio - either URL or base64
   let audio_url = req.body.audio_url;
   let audio_base64 = req.body.audio_base64;
 
-  // Handle image_urls - either array or JSON string
   let image_urls = req.body.image_urls;
   if (typeof image_urls === 'string') {
     try { image_urls = JSON.parse(image_urls); } catch(e) {
-      console.log('Failed to parse image_urls string:', e.message);
+      console.log('Failed to parse image_urls:', e.message);
     }
   }
 
-  console.log('audio_url:', audio_url ? 'present' : 'missing');
   console.log('audio_base64:', audio_base64 ? `present (${audio_base64.length} chars)` : 'missing');
   console.log('image_urls:', image_urls ? `${image_urls.length} URLs` : 'missing');
 
-  // Validate
   if (!audio_url && !audio_base64) {
     return res.status(400).json({ error: 'Missing audio_url or audio_base64' });
   }
@@ -75,7 +72,20 @@ app.post('/assemble-video', async (req, res) => {
       console.log(`[${jobId}] Audio downloaded: ${fs.statSync(audioPath).size} bytes`);
     }
 
-    // Step 2: Download images
+    // Step 2: Get actual audio duration
+    let audioDuration = 180; // default 3 minutes
+    try {
+      const ffprobePath = ffmpegInstaller.path.replace('ffmpeg', 'ffprobe');
+      const result = execSync(
+        `"${ffprobePath}" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`
+      );
+      audioDuration = parseFloat(result.toString().trim());
+      console.log(`[${jobId}] Audio duration: ${audioDuration} seconds`);
+    } catch(e) {
+      console.log(`[${jobId}] Could not detect audio duration, using default ${audioDuration}s`);
+    }
+
+    // Step 3: Download images
     console.log(`[${jobId}] Downloading ${image_urls.length} images...`);
     const imagePaths = [];
 
@@ -91,25 +101,28 @@ app.post('/assemble-video', async (req, res) => {
         console.log(`[${jobId}] Image ${i + 1}/${image_urls.length} done`);
       } catch (err) {
         console.log(`[${jobId}] Image ${i + 1} failed: ${err.message}`);
-        if (imagePaths.length > 0) {
-          imagePaths.push(imagePaths[0]);
-        }
+        if (imagePaths.length > 0) imagePaths.push(imagePaths[0]);
       }
       await new Promise(r => setTimeout(r, 300));
     }
 
-    if (imagePaths.length === 0) {
-      throw new Error('No images downloaded successfully');
-    }
+    if (imagePaths.length === 0) throw new Error('No images downloaded');
 
-    // Step 3: Create image list for FFmpeg
+    // Step 4: Calculate scene duration from audio length
+    const autoSceneDuration = Math.ceil(audioDuration / imagePaths.length);
+    console.log(`[${jobId}] Auto scene duration: ${autoSceneDuration}s per scene`);
+
+    // Step 5: Create image list for FFmpeg
     const listPath = path.join(jobDir, 'images.txt');
-    let listContent = imagePaths.map(p => `file '${p}'\nduration ${scene_duration}`).join('\n');
+    let listContent = imagePaths.map(p =>
+      `file '${p}'\nduration ${autoSceneDuration}`
+    ).join('\n');
+    // Add last image again (FFmpeg concat requirement)
     listContent += `\nfile '${imagePaths[imagePaths.length - 1]}'`;
     fs.writeFileSync(listPath, listContent);
-    console.log(`[${jobId}] Image list created with ${imagePaths.length} images`);
+    console.log(`[${jobId}] Image list created`);
 
-    // Step 4: Assemble with FFmpeg
+    // Step 6: Assemble with FFmpeg
     console.log(`[${jobId}] Running FFmpeg...`);
     const outputPath = path.join(jobDir, 'output.mp4');
 
@@ -126,7 +139,6 @@ app.post('/assemble-video', async (req, res) => {
           '-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1',
           '-c:a aac',
           '-b:a 128k',
-          '-shortest',
           '-movflags +faststart'
         ])
         .output(outputPath)
@@ -137,12 +149,13 @@ app.post('/assemble-video', async (req, res) => {
         .run();
     });
 
-    // Step 5: Return video as base64
+    // Step 7: Return video as base64
     const videoBuffer = fs.readFileSync(outputPath);
     const videoBase64 = videoBuffer.toString('base64');
     const videoSizeMb = (videoBuffer.length / 1024 / 1024).toFixed(2);
+    const totalDuration = autoSceneDuration * imagePaths.length;
 
-    console.log(`[${jobId}] Done! Size: ${videoSizeMb} MB`);
+    console.log(`[${jobId}] Done! Size: ${videoSizeMb} MB, Duration: ~${totalDuration}s`);
 
     // Cleanup
     fs.rmSync(jobDir, { recursive: true, force: true });
@@ -152,6 +165,8 @@ app.post('/assemble-video', async (req, res) => {
       job_id: jobId,
       title: title,
       video_size_mb: videoSizeMb,
+      audio_duration_seconds: audioDuration,
+      scene_duration_seconds: autoSceneDuration,
       video_base64: videoBase64,
       message: 'Video assembled successfully!'
     });
