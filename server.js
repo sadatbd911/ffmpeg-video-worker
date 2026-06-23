@@ -48,9 +48,18 @@ app.post('/assemble-video', async (req, res) => {
     // ── Step 1: Download audio ──────────────────────────────────────────────
     console.log(`[${jobId}] Downloading audio...`);
     const audioPath = path.join(jobDir, 'audio.mp3');
-    const audioResp = await axios.get(audio_url, { responseType: 'arraybuffer' });
-    fs.writeFileSync(audioPath, Buffer.from(audioResp.data));
-    console.log(`[${jobId}] Audio downloaded: ${fs.statSync(audioPath).size} bytes`);
+
+if (req.body.audio_base64) {
+  // Accept base64 audio directly
+  const audioBuffer = Buffer.from(req.body.audio_base64, 'base64');
+  fs.writeFileSync(audioPath, audioBuffer);
+  console.log(`[${jobId}] Audio from base64: ${audioBuffer.length} bytes`);
+} else {
+  // Download from URL
+  const audioResp = await axios.get(audio_url, { responseType: 'arraybuffer' });
+  fs.writeFileSync(audioPath, Buffer.from(audioResp.data));
+  console.log(`[${jobId}] Audio downloaded: ${fs.statSync(audioPath).size} bytes`);
+}
 
     // ── Step 2: Download all images ─────────────────────────────────────────
     console.log(`[${jobId}] Downloading ${image_urls.length} images...`);
