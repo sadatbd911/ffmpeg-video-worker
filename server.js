@@ -99,12 +99,10 @@ app.post('/assemble-video', async (req, res) => {
       const imgPath = path.join(jobDir, `scene_${String(i + 1).padStart(2, '0')}.jpg`);
       try {
         if (image_base64_list && image_base64_list[i]) {
-          // Save from base64
           const imgBuffer = Buffer.from(image_base64_list[i], 'base64');
           fs.writeFileSync(imgPath, imgBuffer);
           console.log(`[${jobId}] Image ${i + 1}/${totalImages} saved from base64 (${(imgBuffer.length / 1024).toFixed(0)}KB)`);
         } else if (image_urls && image_urls[i]) {
-          // Download from URL
           const imgResp = await axios.get(image_urls[i], { responseType: 'arraybuffer', timeout: 30000 });
           fs.writeFileSync(imgPath, Buffer.from(imgResp.data));
           console.log(`[${jobId}] Image ${i + 1}/${totalImages} downloaded from URL`);
@@ -123,38 +121,112 @@ app.post('/assemble-video', async (req, res) => {
     const autoSceneDuration = Math.ceil(audioDuration / imagePaths.length);
     console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s × ${imagePaths.length} scenes`);
 
-    // Step 5: Create image list
-    const listPath = path.join(jobDir, 'images.txt');
-    let listContent = imagePaths.map(p => `file '${p}'\nduration ${autoSceneDuration}`).join('\n');
-    listContent += `\nfile '${imagePaths[imagePaths.length - 1]}'`;
-    fs.writeFileSync(listPath, listContent);
+    // Step 5: Convert each image to a short video clip with dissolve transition
+    const TRANSITION_DURATION = 1; // 1 second dissolve
+    const clipPaths = [];
 
-    // Step 6: FFmpeg assembly
-    console.log(`[${jobId}] Running FFmpeg...`);
+    console.log(`[${jobId}] Creating individual clips with dissolve...`);
+    for (let i = 0; i < imagePaths.length; i++) {
+      const clipPath = path.join(jobDir, `clip_${String(i + 1).padStart(2, '0')}.mp4`);
+      await new Promise((resolve, reject) => {
+        ffmpeg()
+          .input(imagePaths[i])
+          .inputOptions(['-loop 1'])
+          .outputOptions([
+            `-t ${autoSceneDuration}`,
+            '-c:v libx264',
+            '-preset fast',
+            '-crf 23',
+            '-pix_fmt yuv420p',
+            '-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1',
+            '-r 25'
+          ])
+          .output(clipPath)
+          .on('end', () => {
+            clipPaths.push(clipPath);
+            console.log(`[${jobId}] Clip ${i + 1}/${imagePaths.length} created`);
+            resolve();
+          })
+          .on('error', reject)
+          .run();
+      });
+    }
+
+    // Step 6: Build xfade dissolve filter chain
+    console.log(`[${jobId}] Building dissolve transition filter...`);
     const outputPath = path.join(jobDir, 'output.mp4');
 
-    await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(listPath)
-        .inputOptions(['-f concat', '-safe 0'])
-        .input(audioPath)
-        .outputOptions([
-          '-c:v libx264',
-          '-preset fast',
-          '-crf 23',
-          '-pix_fmt yuv420p',
-          '-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1',
-          '-c:a aac',
-          '-b:a 128k',
-          '-movflags +faststart'
-        ])
-        .output(outputPath)
-        .on('start', () => console.log(`[${jobId}] FFmpeg started`))
-        .on('progress', p => console.log(`[${jobId}] Progress: ${Math.round(p.percent || 0)}%`))
-        .on('end', () => { console.log(`[${jobId}] FFmpeg done!`); resolve(); })
-        .on('error', (err) => { reject(err); })
-        .run();
-    });
+    if (clipPaths.length === 1) {
+      // Only one image — no transition needed
+      const listPath = path.join(jobDir, 'images.txt');
+      fs.writeFileSync(listPath, `file '${clipPaths[0]}'`);
+
+      await new Promise((resolve, reject) => {
+        ffmpeg()
+          .input(clipPaths[0])
+          .input(audioPath)
+          .outputOptions([
+            '-c:v libx264',
+            '-preset fast',
+            '-crf 23',
+            '-pix_fmt yuv420p',
+            '-c:a aac',
+            '-b:a 128k',
+            '-movflags +faststart',
+            `-t ${audioDuration}`
+          ])
+          .output(outputPath)
+          .on('end', resolve)
+          .on('error', reject)
+          .run();
+      });
+
+    } else {
+      // Build xfade filter chain for dissolve transitions
+      // Each clip overlaps by TRANSITION_DURATION seconds
+      let filterComplex = '';
+      let lastOutput = '[0:v]';
+
+      for (let i = 1; i < clipPaths.length; i++) {
+        const offset = (autoSceneDuration - TRANSITION_DURATION) * i;
+        const currentOutput = i === clipPaths.length - 1 ? '[vout]' : `[v${i}]`;
+        filterComplex += `${lastOutput}[${i}:v]xfade=transition=dissolve:duration=${TRANSITION_DURATION}:offset=${offset}${currentOutput}`;
+        if (i < clipPaths.length - 1) filterComplex += '; ';
+        lastOutput = currentOutput;
+      }
+
+      console.log(`[${jobId}] Filter: ${filterComplex}`);
+
+      // Build ffmpeg command with all clips
+      let cmd = ffmpeg();
+      for (const clip of clipPaths) {
+        cmd = cmd.input(clip);
+      }
+      cmd = cmd.input(audioPath);
+
+      await new Promise((resolve, reject) => {
+        cmd
+          .complexFilter(filterComplex)
+          .outputOptions([
+            '-map [vout]',
+            `-map ${clipPaths.length}:a`,
+            '-c:v libx264',
+            '-preset fast',
+            '-crf 23',
+            '-pix_fmt yuv420p',
+            '-c:a aac',
+            '-b:a 128k',
+            '-movflags +faststart',
+            `-t ${audioDuration}`
+          ])
+          .output(outputPath)
+          .on('start', () => console.log(`[${jobId}] FFmpeg dissolve started`))
+          .on('progress', p => console.log(`[${jobId}] Progress: ${Math.round(p.percent || 0)}%`))
+          .on('end', () => { console.log(`[${jobId}] FFmpeg dissolve done!`); resolve(); })
+          .on('error', (err) => { reject(err); })
+          .run();
+      });
+    }
 
     const videoBuffer = fs.readFileSync(outputPath);
     const videoBase64 = videoBuffer.toString('base64');
@@ -173,7 +245,7 @@ app.post('/assemble-video', async (req, res) => {
       scene_duration_seconds: autoSceneDuration,
       total_video_seconds: autoSceneDuration * imagePaths.length,
       video_base64: videoBase64,
-      message: 'Video assembled successfully!'
+      message: 'Video assembled successfully with dissolve transitions!'
     });
 
   } catch (err) {
