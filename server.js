@@ -174,28 +174,32 @@ app.post('/assemble-video', async (req, res) => {
       for (const clip of clipPaths) cmd = cmd.input(clip);
       cmd = cmd.input(audioPath);
 
-      await new Promise((resolve, reject) => {
-        cmd
-          .complexFilter(filterComplex)
-          .outputOptions([
-            '-map [vout]',
-            `-map ${clipPaths.length}:a`,
-            '-c:v libx264',
-            '-preset fast',
-            '-crf 23',
-            '-pix_fmt yuv420p',
-            '-c:a aac',
-            '-b:a 128k',
-            '-movflags +faststart',
-            `-t ${audioDuration}`
-          ])
-          .output(outputPath)
-          .on('start', () => console.log(`[${jobId}] FFmpeg dissolve started`))
-          .on('progress', p => console.log(`[${jobId}] Progress: ${Math.round(p.percent || 0)}%`))
-          .on('end', () => { console.log(`[${jobId}] FFmpeg dissolve done!`); resolve(); })
-          .on('error', (err) => { reject(err); })
-          .run();
-      });
+      // Replace the entire Promise block for dissolve
+await new Promise((resolve, reject) => {
+  let cmd = ffmpeg();
+  for (const clip of clipPaths) cmd = cmd.input(clip);
+  cmd = cmd.input(audioPath);
+
+  cmd
+    .outputOptions([
+      `-filter_complex`, filterComplex,
+      '-map [vout]',
+      `-map ${clipPaths.length}:a`,
+      '-c:v libx264',
+      '-preset fast',
+      '-crf 23',
+      '-pix_fmt yuv420p',
+      '-c:a aac',
+      '-b:a 128k',
+      '-movflags +faststart',
+      `-t ${audioDuration}`
+    ])
+    .output(outputPath)
+    .on('start', cmd => console.log(`[${jobId}] FFmpeg cmd: ${cmd}`))
+    .on('end', () => { console.log(`[${jobId}] Done!`); resolve(); })
+    .on('error', reject)
+    .run();
+});
     }
 
     const videoBuffer = fs.readFileSync(outputPath);
