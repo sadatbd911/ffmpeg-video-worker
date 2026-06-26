@@ -68,29 +68,20 @@ app.post('/assemble-video', async (req, res) => {
     try {
       audioDuration = await new Promise((resolve) => {
         ffmpeg.ffprobe(audioPath, (err, metadata) => {
-          if (err) {
-            console.log(`[${jobId}] ffprobe error: ${err.message}`);
-            resolve(0);
-          } else {
-            const dur = metadata.format.duration;
-            console.log(`[${jobId}] ffprobe duration: ${dur}s`);
-            resolve(dur || 0);
-          }
+          if (err) { console.log(`[${jobId}] ffprobe error: ${err.message}`); resolve(0); }
+          else { const dur = metadata.format.duration; console.log(`[${jobId}] ffprobe duration: ${dur}s`); resolve(dur || 0); }
         });
       });
-    } catch(e) {
-      console.log(`[${jobId}] ffprobe failed: ${e.message}`);
-    }
+    } catch(e) { console.log(`[${jobId}] ffprobe failed: ${e.message}`); }
 
     if (!audioDuration || audioDuration <= 0) {
       const audioSize = fs.statSync(audioPath).size;
       audioDuration = Math.round(audioSize / 16000);
       console.log(`[${jobId}] Size-based duration estimate: ${audioDuration}s`);
     }
-
     console.log(`[${jobId}] Final audio duration: ${audioDuration}s`);
 
-    // Step 3: Save images (supports both base64 and URLs)
+    // Step 3: Save images
     const totalImages = image_base64_list ? image_base64_list.length : image_urls.length;
     console.log(`[${jobId}] Processing ${totalImages} images...`);
 
@@ -118,14 +109,13 @@ app.post('/assemble-video', async (req, res) => {
     if (imagePaths.length === 0) throw new Error('No images downloaded');
 
     // Step 4: Calculate scene duration
-    const autoSceneDuration = Math.ceil(audioDuration / imagePaths.length);
-    console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s × ${imagePaths.length} scenes`);
+    const TRANSITION_DURATION = 1;
+    const autoSceneDuration = Math.max(3, Math.ceil(audioDuration / imagePaths.length));
+    console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s x ${imagePaths.length} scenes`);
 
-    // Step 5: Convert each image to a short video clip with dissolve transition
-    const TRANSITION_DURATION = 1; // 1 second dissolve
+    // Step 5: Create individual clips
+    console.log(`[${jobId}] Creating individual clips...`);
     const clipPaths = [];
-
-    console.log(`[${jobId}] Creating individual clips with dissolve...`);
     for (let i = 0; i < imagePaths.length; i++) {
       const clipPath = path.join(jobDir, `clip_${String(i + 1).padStart(2, '0')}.mp4`);
       await new Promise((resolve, reject) => {
@@ -142,39 +132,23 @@ app.post('/assemble-video', async (req, res) => {
             '-r 25'
           ])
           .output(clipPath)
-          .on('end', () => {
-            clipPaths.push(clipPath);
-            console.log(`[${jobId}] Clip ${i + 1}/${imagePaths.length} created`);
-            resolve();
-          })
+          .on('end', () => { clipPaths.push(clipPath); console.log(`[${jobId}] Clip ${i+1}/${imagePaths.length} done`); resolve(); })
           .on('error', reject)
           .run();
       });
     }
 
-    // Step 6: Build xfade dissolve filter chain
-    console.log(`[${jobId}] Building dissolve transition filter...`);
+    // Step 6: Assemble with dissolve transitions
+    console.log(`[${jobId}] Assembling with dissolve transitions...`);
     const outputPath = path.join(jobDir, 'output.mp4');
 
     if (clipPaths.length === 1) {
-      // Only one image — no transition needed
-      const listPath = path.join(jobDir, 'images.txt');
-      fs.writeFileSync(listPath, `file '${clipPaths[0]}'`);
-
+      // Single image - no transition needed
       await new Promise((resolve, reject) => {
         ffmpeg()
           .input(clipPaths[0])
           .input(audioPath)
-          .outputOptions([
-            '-c:v libx264',
-            '-preset fast',
-            '-crf 23',
-            '-pix_fmt yuv420p',
-            '-c:a aac',
-            '-b:a 128k',
-            '-movflags +faststart',
-            `-t ${audioDuration}`
-          ])
+          .outputOptions(['-c:v libx264', '-preset fast', '-crf 23', '-pix_fmt yuv420p', '-c:a aac', '-b:a 128k', '-movflags +faststart', `-t ${audioDuration}`])
           .output(outputPath)
           .on('end', resolve)
           .on('error', reject)
@@ -182,26 +156,23 @@ app.post('/assemble-video', async (req, res) => {
       });
 
     } else {
-      // Build xfade filter chain for dissolve transitions
-      // Each clip overlaps by TRANSITION_DURATION seconds
-      let filterComplex = '';
-      let lastOutput = '[0:v]';
+      // Build xfade dissolve filter chain
+      // Format: [0:v][1:v]xfade=transition=dissolve:duration=1:offset=N[v1]; [v1][2:v]xfade=...
+      const filterParts = [];
+      let prevLabel = '[0:v]';
 
       for (let i = 1; i < clipPaths.length; i++) {
-        const offset = (autoSceneDuration - TRANSITION_DURATION) * i;
-        const currentOutput = i === clipPaths.length - 1 ? '[vout]' : `[v${i}]`;
-        filterComplex += `${lastOutput}[${i}:v]xfade=transition=dissolve:duration=${TRANSITION_DURATION}:offset=${offset}${currentOutput}`;
-        if (i < clipPaths.length - 1) filterComplex += '; ';
-        lastOutput = currentOutput;
+        const offset = (autoSceneDuration - TRANSITION_DURATION) * i - (TRANSITION_DURATION * (i - 1));
+        const outLabel = i === clipPaths.length - 1 ? '[vout]' : `[v${i}]`;
+        filterParts.push(`${prevLabel}[${i}:v]xfade=transition=dissolve:duration=${TRANSITION_DURATION}:offset=${offset}${outLabel}`);
+        prevLabel = outLabel;
       }
 
-      console.log(`[${jobId}] Filter: ${filterComplex}`);
+      const filterComplex = filterParts.join(';');
+      console.log(`[${jobId}] Filter complex: ${filterComplex}`);
 
-      // Build ffmpeg command with all clips
       let cmd = ffmpeg();
-      for (const clip of clipPaths) {
-        cmd = cmd.input(clip);
-      }
+      for (const clip of clipPaths) cmd = cmd.input(clip);
       cmd = cmd.input(audioPath);
 
       await new Promise((resolve, reject) => {
@@ -231,7 +202,6 @@ app.post('/assemble-video', async (req, res) => {
     const videoBuffer = fs.readFileSync(outputPath);
     const videoBase64 = videoBuffer.toString('base64');
     const videoSizeMb = (videoBuffer.length / 1024 / 1024).toFixed(2);
-
     console.log(`[${jobId}] Done! Size: ${videoSizeMb}MB`);
 
     fs.rmSync(jobDir, { recursive: true, force: true });
