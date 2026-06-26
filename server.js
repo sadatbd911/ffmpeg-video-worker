@@ -110,7 +110,7 @@ app.post('/assemble-video', async (req, res) => {
 
     // Step 4: Calculate scene duration
     const TRANSITION_DURATION = 1;
-    const autoSceneDuration = Math.max(3, Math.ceil(audioDuration / imagePaths.length));
+    const autoSceneDuration = Math.max(4, Math.ceil(audioDuration / imagePaths.length));
     console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s x ${imagePaths.length} scenes`);
 
     // Step 5: Create individual clips
@@ -143,12 +143,11 @@ app.post('/assemble-video', async (req, res) => {
     const outputPath = path.join(jobDir, 'output.mp4');
 
     if (clipPaths.length === 1) {
-      // Single image - no transition needed
       await new Promise((resolve, reject) => {
         ffmpeg()
           .input(clipPaths[0])
           .input(audioPath)
-          .outputOptions(['-c:v libx264', '-preset fast', '-crf 23', '-pix_fmt yuv420p', '-c:a aac', '-b:a 128k', '-movflags +faststart', `-t ${audioDuration}`])
+          .outputOptions(['-c:v copy', '-c:a aac', '-b:a 128k', '-movflags +faststart', `-t ${audioDuration}`])
           .output(outputPath)
           .on('end', resolve)
           .on('error', reject)
@@ -156,20 +155,20 @@ app.post('/assemble-video', async (req, res) => {
       });
 
     } else {
-      // Build xfade dissolve filter chain
-      // Format: [0:v][1:v]xfade=transition=dissolve:duration=1:offset=N[v1]; [v1][2:v]xfade=...
+      // Build xfade dissolve filter chain correctly
+      // offset = how many seconds into the TOTAL video the transition starts
       const filterParts = [];
       let prevLabel = '[0:v]';
 
       for (let i = 1; i < clipPaths.length; i++) {
-        const offset = (autoSceneDuration - TRANSITION_DURATION) * i - (TRANSITION_DURATION * (i - 1));
+        const offset = (autoSceneDuration - TRANSITION_DURATION) * i;
         const outLabel = i === clipPaths.length - 1 ? '[vout]' : `[v${i}]`;
         filterParts.push(`${prevLabel}[${i}:v]xfade=transition=dissolve:duration=${TRANSITION_DURATION}:offset=${offset}${outLabel}`);
         prevLabel = outLabel;
       }
 
       const filterComplex = filterParts.join(';');
-      console.log(`[${jobId}] Filter complex: ${filterComplex}`);
+      console.log(`[${jobId}] Filter: ${filterComplex}`);
 
       let cmd = ffmpeg();
       for (const clip of clipPaths) cmd = cmd.input(clip);
