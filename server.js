@@ -109,15 +109,16 @@ app.post('/assemble-video', async (req, res) => {
     if (imagePaths.length === 0) throw new Error('No images downloaded');
 
     // Step 4: Calculate scene duration
-    const TRANSITION_DURATION = 1;
+    const FADE_DURATION = 0.5; // 0.5 second fade in/out per clip
     const autoSceneDuration = Math.max(4, Math.ceil(audioDuration / imagePaths.length));
     console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s x ${imagePaths.length} scenes`);
 
-    // Step 5: Create individual clips
-    console.log(`[${jobId}] Creating individual clips...`);
+    // Step 5: Create individual clips WITH fade in/out (no xfade needed)
+    console.log(`[${jobId}] Creating clips with fade in/out...`);
     const clipPaths = [];
     for (let i = 0; i < imagePaths.length; i++) {
       const clipPath = path.join(jobDir, `clip_${String(i + 1).padStart(2, '0')}.mp4`);
+      const fadeOut = autoSceneDuration - FADE_DURATION;
       await new Promise((resolve, reject) => {
         ffmpeg()
           .input(imagePaths[i])
@@ -128,7 +129,7 @@ app.post('/assemble-video', async (req, res) => {
             '-preset fast',
             '-crf 23',
             '-pix_fmt yuv420p',
-            '-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1',
+            `-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fade=t=in:st=0:d=${FADE_DURATION},fade=t=out:st=${fadeOut}:d=${FADE_DURATION}`,
             '-r 25'
           ])
           .output(clipPath)
@@ -138,69 +139,35 @@ app.post('/assemble-video', async (req, res) => {
       });
     }
 
-    // Step 6: Assemble with dissolve transitions
-    console.log(`[${jobId}] Assembling with dissolve transitions...`);
+    // Step 6: Concat all clips + audio
+    console.log(`[${jobId}] Concatenating clips...`);
+    const listPath = path.join(jobDir, 'clips.txt');
+    fs.writeFileSync(listPath, clipPaths.map(p => `file '${p}'`).join('\n'));
+
     const outputPath = path.join(jobDir, 'output.mp4');
 
-    if (clipPaths.length === 1) {
-      await new Promise((resolve, reject) => {
-        ffmpeg()
-          .input(clipPaths[0])
-          .input(audioPath)
-          .outputOptions(['-c:v copy', '-c:a aac', '-b:a 128k', '-movflags +faststart', `-t ${audioDuration}`])
-          .output(outputPath)
-          .on('end', resolve)
-          .on('error', reject)
-          .run();
-      });
-
-    } else {
-      // Build xfade dissolve filter chain correctly
-      // offset = how many seconds into the TOTAL video the transition starts
-      const filterParts = [];
-      let prevLabel = '[0:v]';
-
-      for (let i = 1; i < clipPaths.length; i++) {
-        const offset = (autoSceneDuration - TRANSITION_DURATION) * i;
-        const outLabel = i === clipPaths.length - 1 ? '[vout]' : `[v${i}]`;
-        filterParts.push(`${prevLabel}[${i}:v]xfade=transition=dissolve:duration=${TRANSITION_DURATION}:offset=${offset}${outLabel}`);
-        prevLabel = outLabel;
-      }
-
-      const filterComplex = filterParts.join(';');
-      console.log(`[${jobId}] Filter: ${filterComplex}`);
-
-      let cmd = ffmpeg();
-      for (const clip of clipPaths) cmd = cmd.input(clip);
-      cmd = cmd.input(audioPath);
-
-      // Replace the entire Promise block for dissolve
-await new Promise((resolve, reject) => {
-  let cmd = ffmpeg();
-  for (const clip of clipPaths) cmd = cmd.input(clip);
-  cmd = cmd.input(audioPath);
-
-  cmd
-    .outputOptions([
-      `-filter_complex`, filterComplex,
-      '-map [vout]',
-      `-map ${clipPaths.length}:a`,
-      '-c:v libx264',
-      '-preset fast',
-      '-crf 23',
-      '-pix_fmt yuv420p',
-      '-c:a aac',
-      '-b:a 128k',
-      '-movflags +faststart',
-      `-t ${audioDuration}`
-    ])
-    .output(outputPath)
-    .on('start', cmd => console.log(`[${jobId}] FFmpeg cmd: ${cmd}`))
-    .on('end', () => { console.log(`[${jobId}] Done!`); resolve(); })
-    .on('error', reject)
-    .run();
-});
-    }
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(listPath)
+        .inputOptions(['-f concat', '-safe 0'])
+        .input(audioPath)
+        .outputOptions([
+          '-c:v libx264',
+          '-preset fast',
+          '-crf 23',
+          '-pix_fmt yuv420p',
+          '-c:a aac',
+          '-b:a 128k',
+          '-movflags +faststart',
+          `-t ${audioDuration}`
+        ])
+        .output(outputPath)
+        .on('start', () => console.log(`[${jobId}] FFmpeg concat started`))
+        .on('progress', p => console.log(`[${jobId}] Progress: ${Math.round(p.percent || 0)}%`))
+        .on('end', () => { console.log(`[${jobId}] FFmpeg done!`); resolve(); })
+        .on('error', (err) => { reject(err); })
+        .run();
+    });
 
     const videoBuffer = fs.readFileSync(outputPath);
     const videoBase64 = videoBuffer.toString('base64');
@@ -218,7 +185,7 @@ await new Promise((resolve, reject) => {
       scene_duration_seconds: autoSceneDuration,
       total_video_seconds: autoSceneDuration * imagePaths.length,
       video_base64: videoBase64,
-      message: 'Video assembled successfully with dissolve transitions!'
+      message: 'Video assembled successfully with fade transitions!'
     });
 
   } catch (err) {
