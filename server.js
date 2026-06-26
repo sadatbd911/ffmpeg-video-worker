@@ -29,20 +29,16 @@ app.post('/assemble-video', async (req, res) => {
   let audio_url = req.body.audio_url;
   let audio_base64 = req.body.audio_base64;
   let image_urls = req.body.image_urls;
-  let image_base64_list = req.body.image_base64_list;
 
   if (typeof image_urls === 'string') {
     try { image_urls = JSON.parse(image_urls); } catch(e) {}
-  }
-  if (typeof image_base64_list === 'string') {
-    try { image_base64_list = JSON.parse(image_base64_list); } catch(e) {}
   }
 
   if (!audio_url && !audio_base64) {
     return res.status(400).json({ error: 'Missing audio_url or audio_base64' });
   }
-  if ((!image_urls || image_urls.length === 0) && (!image_base64_list || image_base64_list.length === 0)) {
-    return res.status(400).json({ error: 'Missing image_urls or image_base64_list' });
+  if (!image_urls || image_urls.length === 0) {
+    return res.status(400).json({ error: 'Missing image_urls' });
   }
 
   const jobId = story_id || Date.now().toString();
@@ -63,87 +59,66 @@ app.post('/assemble-video', async (req, res) => {
       fs.writeFileSync(audioPath, Buffer.from(audioResp.data));
     }
 
-    // Step 2: Detect audio duration
+    // Step 2: Detect audio duration using fluent-ffmpeg's ffprobe
     let audioDuration = 0;
     try {
       audioDuration = await new Promise((resolve) => {
         ffmpeg.ffprobe(audioPath, (err, metadata) => {
-          if (err) { console.log(`[${jobId}] ffprobe error: ${err.message}`); resolve(0); }
-          else { const dur = metadata.format.duration; console.log(`[${jobId}] ffprobe duration: ${dur}s`); resolve(dur || 0); }
+          if (err) {
+            console.log(`[${jobId}] ffprobe error: ${err.message}`);
+            resolve(0);
+          } else {
+            const dur = metadata.format.duration;
+            console.log(`[${jobId}] ffprobe duration: ${dur}s`);
+            resolve(dur || 0);
+          }
         });
       });
-    } catch(e) { console.log(`[${jobId}] ffprobe failed: ${e.message}`); }
+    } catch(e) {
+      console.log(`[${jobId}] ffprobe failed: ${e.message}`);
+    }
 
+    // Fallback: estimate from file size if ffprobe fails
+    // MPGA/MP3 at 128kbps = ~16KB per second
     if (!audioDuration || audioDuration <= 0) {
       const audioSize = fs.statSync(audioPath).size;
       audioDuration = Math.round(audioSize / 16000);
-      console.log(`[${jobId}] Size-based duration estimate: ${audioDuration}s`);
+      console.log(`[${jobId}] Size-based duration estimate: ${audioDuration}s (file: ${audioSize} bytes)`);
     }
+
     console.log(`[${jobId}] Final audio duration: ${audioDuration}s`);
 
-    // Step 3: Save images
-    const totalImages = image_base64_list ? image_base64_list.length : image_urls.length;
-    console.log(`[${jobId}] Processing ${totalImages} images...`);
-
+    // Step 3: Download images
+    console.log(`[${jobId}] Downloading ${image_urls.length} images...`);
     const imagePaths = [];
-    for (let i = 0; i < totalImages; i++) {
+    for (let i = 0; i < image_urls.length; i++) {
       const imgPath = path.join(jobDir, `scene_${String(i + 1).padStart(2, '0')}.jpg`);
       try {
-        if (image_base64_list && image_base64_list[i]) {
-          const imgBuffer = Buffer.from(image_base64_list[i], 'base64');
-          fs.writeFileSync(imgPath, imgBuffer);
-          console.log(`[${jobId}] Image ${i + 1}/${totalImages} saved from base64 (${(imgBuffer.length / 1024).toFixed(0)}KB)`);
-        } else if (image_urls && image_urls[i]) {
-          const imgResp = await axios.get(image_urls[i], { responseType: 'arraybuffer', timeout: 30000 });
-          fs.writeFileSync(imgPath, Buffer.from(imgResp.data));
-          console.log(`[${jobId}] Image ${i + 1}/${totalImages} downloaded from URL`);
-        }
+        const imgResp = await axios.get(image_urls[i], { responseType: 'arraybuffer', timeout: 30000 });
+        fs.writeFileSync(imgPath, Buffer.from(imgResp.data));
         imagePaths.push(imgPath);
+        console.log(`[${jobId}] Image ${i + 1}/${image_urls.length} done`);
       } catch (err) {
         console.log(`[${jobId}] Image ${i + 1} failed: ${err.message}`);
         if (imagePaths.length > 0) imagePaths.push(imagePaths[0]);
       }
-      await new Promise(r => setTimeout(r, 100));
+      await new Promise(r => setTimeout(r, 300));
     }
 
     if (imagePaths.length === 0) throw new Error('No images downloaded');
 
-    // Step 4: Calculate scene duration
-    const FADE_DURATION = 0.5; // 0.5 second fade in/out per clip
-    const autoSceneDuration = Math.max(4, Math.ceil(audioDuration / imagePaths.length));
-    console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s x ${imagePaths.length} scenes`);
+    // Step 4: Calculate scene duration from actual audio
+    const autoSceneDuration = Math.ceil(audioDuration / imagePaths.length);
+    console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s × ${imagePaths.length} scenes = ${autoSceneDuration * imagePaths.length}s total`);
 
-    // Step 5: Create individual clips WITH fade in/out (no xfade needed)
-    console.log(`[${jobId}] Creating clips with fade in/out...`);
-    const clipPaths = [];
-    for (let i = 0; i < imagePaths.length; i++) {
-      const clipPath = path.join(jobDir, `clip_${String(i + 1).padStart(2, '0')}.mp4`);
-      const fadeOut = autoSceneDuration - FADE_DURATION;
-      await new Promise((resolve, reject) => {
-        ffmpeg()
-          .input(imagePaths[i])
-          .inputOptions(['-loop 1'])
-          .outputOptions([
-            `-t ${autoSceneDuration}`,
-            '-c:v libx264',
-            '-preset fast',
-            '-crf 23',
-            '-pix_fmt yuv420p',
-            `-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fade=t=in:st=0:d=${FADE_DURATION},fade=t=out:st=${fadeOut}:d=${FADE_DURATION}`,
-            '-r 25'
-          ])
-          .output(clipPath)
-          .on('end', () => { clipPaths.push(clipPath); console.log(`[${jobId}] Clip ${i+1}/${imagePaths.length} done`); resolve(); })
-          .on('error', reject)
-          .run();
-      });
-    }
+    // Step 5: Create image list
+    const listPath = path.join(jobDir, 'images.txt');
+    let listContent = imagePaths.map(p => `file '${p}'\nduration ${autoSceneDuration}`).join('\n');
+    listContent += `\nfile '${imagePaths[imagePaths.length - 1]}'`;
+    fs.writeFileSync(listPath, listContent);
 
-    // Step 6: Concat all clips + audio
-    console.log(`[${jobId}] Concatenating clips...`);
-    const listPath = path.join(jobDir, 'clips.txt');
-    fs.writeFileSync(listPath, clipPaths.map(p => `file '${p}'`).join('\n'));
-
+    // Step 6: FFmpeg assembly
+    console.log(`[${jobId}] Running FFmpeg...`);
     const outputPath = path.join(jobDir, 'output.mp4');
 
     await new Promise((resolve, reject) => {
@@ -156,13 +131,13 @@ app.post('/assemble-video', async (req, res) => {
           '-preset fast',
           '-crf 23',
           '-pix_fmt yuv420p',
+          '-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1',
           '-c:a aac',
           '-b:a 128k',
-          '-movflags +faststart',
-          `-t ${audioDuration}`
+          '-movflags +faststart'
         ])
         .output(outputPath)
-        .on('start', () => console.log(`[${jobId}] FFmpeg concat started`))
+        .on('start', () => console.log(`[${jobId}] FFmpeg started`))
         .on('progress', p => console.log(`[${jobId}] Progress: ${Math.round(p.percent || 0)}%`))
         .on('end', () => { console.log(`[${jobId}] FFmpeg done!`); resolve(); })
         .on('error', (err) => { reject(err); })
@@ -172,7 +147,8 @@ app.post('/assemble-video', async (req, res) => {
     const videoBuffer = fs.readFileSync(outputPath);
     const videoBase64 = videoBuffer.toString('base64');
     const videoSizeMb = (videoBuffer.length / 1024 / 1024).toFixed(2);
-    console.log(`[${jobId}] Done! Size: ${videoSizeMb}MB`);
+
+    console.log(`[${jobId}] Done! Size: ${videoSizeMb}MB, Audio: ${audioDuration}s, Video: ${autoSceneDuration * imagePaths.length}s`);
 
     fs.rmSync(jobDir, { recursive: true, force: true });
 
@@ -185,7 +161,7 @@ app.post('/assemble-video', async (req, res) => {
       scene_duration_seconds: autoSceneDuration,
       total_video_seconds: autoSceneDuration * imagePaths.length,
       video_base64: videoBase64,
-      message: 'Video assembled successfully with fade transitions!'
+      message: 'Video assembled successfully!'
     });
 
   } catch (err) {
