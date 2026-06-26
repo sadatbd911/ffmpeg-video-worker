@@ -29,16 +29,20 @@ app.post('/assemble-video', async (req, res) => {
   let audio_url = req.body.audio_url;
   let audio_base64 = req.body.audio_base64;
   let image_urls = req.body.image_urls;
+  let image_base64_list = req.body.image_base64_list;
 
   if (typeof image_urls === 'string') {
     try { image_urls = JSON.parse(image_urls); } catch(e) {}
+  }
+  if (typeof image_base64_list === 'string') {
+    try { image_base64_list = JSON.parse(image_base64_list); } catch(e) {}
   }
 
   if (!audio_url && !audio_base64) {
     return res.status(400).json({ error: 'Missing audio_url or audio_base64' });
   }
-  if (!image_urls || image_urls.length === 0) {
-    return res.status(400).json({ error: 'Missing image_urls' });
+  if ((!image_urls || image_urls.length === 0) && (!image_base64_list || image_base64_list.length === 0)) {
+    return res.status(400).json({ error: 'Missing image_urls or image_base64_list' });
   }
 
   const jobId = story_id || Date.now().toString();
@@ -59,7 +63,7 @@ app.post('/assemble-video', async (req, res) => {
       fs.writeFileSync(audioPath, Buffer.from(audioResp.data));
     }
 
-    // Step 2: Detect audio duration using fluent-ffmpeg's ffprobe
+    // Step 2: Detect audio duration
     let audioDuration = 0;
     try {
       audioDuration = await new Promise((resolve) => {
@@ -78,38 +82,46 @@ app.post('/assemble-video', async (req, res) => {
       console.log(`[${jobId}] ffprobe failed: ${e.message}`);
     }
 
-    // Fallback: estimate from file size if ffprobe fails
-    // MPGA/MP3 at 128kbps = ~16KB per second
     if (!audioDuration || audioDuration <= 0) {
       const audioSize = fs.statSync(audioPath).size;
       audioDuration = Math.round(audioSize / 16000);
-      console.log(`[${jobId}] Size-based duration estimate: ${audioDuration}s (file: ${audioSize} bytes)`);
+      console.log(`[${jobId}] Size-based duration estimate: ${audioDuration}s`);
     }
 
     console.log(`[${jobId}] Final audio duration: ${audioDuration}s`);
 
-    // Step 3: Download images
-    console.log(`[${jobId}] Downloading ${image_urls.length} images...`);
+    // Step 3: Save images (supports both base64 and URLs)
+    const totalImages = image_base64_list ? image_base64_list.length : image_urls.length;
+    console.log(`[${jobId}] Processing ${totalImages} images...`);
+
     const imagePaths = [];
-    for (let i = 0; i < image_urls.length; i++) {
+    for (let i = 0; i < totalImages; i++) {
       const imgPath = path.join(jobDir, `scene_${String(i + 1).padStart(2, '0')}.jpg`);
       try {
-        const imgResp = await axios.get(image_urls[i], { responseType: 'arraybuffer', timeout: 30000 });
-        fs.writeFileSync(imgPath, Buffer.from(imgResp.data));
+        if (image_base64_list && image_base64_list[i]) {
+          // Save from base64
+          const imgBuffer = Buffer.from(image_base64_list[i], 'base64');
+          fs.writeFileSync(imgPath, imgBuffer);
+          console.log(`[${jobId}] Image ${i + 1}/${totalImages} saved from base64 (${(imgBuffer.length / 1024).toFixed(0)}KB)`);
+        } else if (image_urls && image_urls[i]) {
+          // Download from URL
+          const imgResp = await axios.get(image_urls[i], { responseType: 'arraybuffer', timeout: 30000 });
+          fs.writeFileSync(imgPath, Buffer.from(imgResp.data));
+          console.log(`[${jobId}] Image ${i + 1}/${totalImages} downloaded from URL`);
+        }
         imagePaths.push(imgPath);
-        console.log(`[${jobId}] Image ${i + 1}/${image_urls.length} done`);
       } catch (err) {
         console.log(`[${jobId}] Image ${i + 1} failed: ${err.message}`);
         if (imagePaths.length > 0) imagePaths.push(imagePaths[0]);
       }
-      await new Promise(r => setTimeout(r, 300));
+      await new Promise(r => setTimeout(r, 100));
     }
 
     if (imagePaths.length === 0) throw new Error('No images downloaded');
 
-    // Step 4: Calculate scene duration from actual audio
+    // Step 4: Calculate scene duration
     const autoSceneDuration = Math.ceil(audioDuration / imagePaths.length);
-    console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s × ${imagePaths.length} scenes = ${autoSceneDuration * imagePaths.length}s total`);
+    console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s × ${imagePaths.length} scenes`);
 
     // Step 5: Create image list
     const listPath = path.join(jobDir, 'images.txt');
@@ -148,7 +160,7 @@ app.post('/assemble-video', async (req, res) => {
     const videoBase64 = videoBuffer.toString('base64');
     const videoSizeMb = (videoBuffer.length / 1024 / 1024).toFixed(2);
 
-    console.log(`[${jobId}] Done! Size: ${videoSizeMb}MB, Audio: ${audioDuration}s, Video: ${autoSceneDuration * imagePaths.length}s`);
+    console.log(`[${jobId}] Done! Size: ${videoSizeMb}MB`);
 
     fs.rmSync(jobDir, { recursive: true, force: true });
 
