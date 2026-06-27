@@ -21,95 +21,6 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'FFmpeg Video Worker is running!' });
 });
 
-// ─────────────────────────────────────────────
-// NEW: Generate Thumbnail via Pollinations AI
-// ─────────────────────────────────────────────
-app.post('/generate-thumbnail', async (req, res) => {
-  const { title, description, characters, setting } = req.body;
-
-  if (!title) return res.status(400).json({ error: 'Missing title' });
-
-  // Build an attractive thumbnail prompt
-  const prompt = `Children's YouTube thumbnail, magical bedtime story illustration, 
-    title: "${title}", 
-    characters: ${characters || 'cute animal characters'}, 
-    setting: ${setting || 'magical dreamland'}, 
-    dreamy glowing colors, sparkles, stars, moonlight, 
-    big expressive eyes, adorable, warm cozy atmosphere, 
-    professional digital art, vibrant, eye-catching, 
-    16:9 widescreen, high quality, kawaii style`;
-
-  const encodedPrompt = encodeURIComponent(prompt.trim());
-  const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1280&height=720&nologo=true&seed=${Date.now()}`;
-
-  try {
-    console.log(`[thumbnail] Generating for: ${title}`);
-    const imgResp = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 60000 });
-    const imgBase64 = Buffer.from(imgResp.data).toString('base64');
-    const imgBuffer = Buffer.from(imgResp.data);
-
-    console.log(`[thumbnail] Generated: ${(imgBuffer.length / 1024).toFixed(0)}KB`);
-
-    res.json({
-      success: true,
-      thumbnail_base64: imgBase64,
-      thumbnail_size_kb: (imgBuffer.length / 1024).toFixed(0),
-      prompt_used: prompt.trim(),
-      message: 'Thumbnail generated successfully!'
-    });
-
-  } catch (err) {
-    console.error('[thumbnail] Error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─────────────────────────────────────────────
-// NEW: Upload Thumbnail to YouTube
-// ─────────────────────────────────────────────
-app.post('/upload-thumbnail', async (req, res) => {
-  const { video_id, thumbnail_base64, access_token } = req.body;
-
-  if (!video_id) return res.status(400).json({ error: 'Missing video_id' });
-  if (!thumbnail_base64) return res.status(400).json({ error: 'Missing thumbnail_base64' });
-  if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
-
-  try {
-    console.log(`[upload-thumbnail] Uploading for video: ${video_id}`);
-
-    const imgBuffer = Buffer.from(thumbnail_base64, 'base64');
-
-    const response = await axios.post(
-      `https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${video_id}&uploadType=media`,
-      imgBuffer,
-      {
-        headers: {
-          'Authorization': `Bearer ${access_token}`,
-          'Content-Type': 'image/jpeg',
-          'Content-Length': imgBuffer.length
-        },
-        timeout: 60000
-      }
-    );
-
-    console.log(`[upload-thumbnail] Success for video: ${video_id}`);
-    res.json({
-      success: true,
-      video_id: video_id,
-      youtube_response: response.data,
-      message: 'Thumbnail uploaded to YouTube successfully!'
-    });
-
-  } catch (err) {
-    const errMsg = err.response?.data || err.message;
-    console.error('[upload-thumbnail] Error:', JSON.stringify(errMsg));
-    res.status(500).json({ error: errMsg });
-  }
-});
-
-// ─────────────────────────────────────────────
-// EXISTING: Assemble Video
-// ─────────────────────────────────────────────
 app.post('/assemble-video', async (req, res) => {
   console.log('Request received!');
   console.log('Body keys:', Object.keys(req.body));
@@ -141,6 +52,7 @@ app.post('/assemble-video', async (req, res) => {
   console.log(`[${jobId}] Starting for: ${title}`);
 
   try {
+    // Step 1: Save audio
     const audioPath = path.join(jobDir, 'audio.mp3');
     if (audio_base64) {
       const audioBuffer = Buffer.from(audio_base64, 'base64');
@@ -151,6 +63,7 @@ app.post('/assemble-video', async (req, res) => {
       fs.writeFileSync(audioPath, Buffer.from(audioResp.data));
     }
 
+    // Step 2: Detect audio duration
     let audioDuration = 0;
     try {
       audioDuration = await new Promise((resolve) => {
@@ -177,6 +90,7 @@ app.post('/assemble-video', async (req, res) => {
 
     console.log(`[${jobId}] Final audio duration: ${audioDuration}s`);
 
+    // Step 3: Save images
     const totalImages = image_base64_list ? image_base64_list.length : image_urls.length;
     console.log(`[${jobId}] Processing ${totalImages} images...`);
 
@@ -203,55 +117,62 @@ app.post('/assemble-video', async (req, res) => {
 
     if (imagePaths.length === 0) throw new Error('No images downloaded');
 
-    const fadeDuration = 1; // seconds for crossfade
-    const autoSceneDuration = Math.ceil(audioDuration / imagePaths.length);
-    console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s × ${imagePaths.length} scenes, fade: ${fadeDuration}s`);
+    // Step 4: Calculate durations
+    const fadeDuration = 1; // 1 second dissolve
+    const n = imagePaths.length;
+    const autoSceneDuration = Math.max(Math.ceil(audioDuration / n), fadeDuration + 2);
+    console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s x ${n} scenes, fade: ${fadeDuration}s`);
 
-    console.log(`[${jobId}] Running FFmpeg with xfade dissolve...`);
+    // Step 5: FFmpeg with xfade dissolve
+    console.log(`[${jobId}] Running FFmpeg with dissolve transitions...`);
     const outputPath = path.join(jobDir, 'output.mp4');
 
     await new Promise((resolve, reject) => {
-      const n = imagePaths.length;
       const cmd = ffmpeg();
 
-      // Add all image inputs, each held for autoSceneDuration
+      // Add each image as looped input for autoSceneDuration
       imagePaths.forEach(p => {
-        cmd.input(p).inputOptions([`-loop 1`, `-t ${autoSceneDuration}`]);
+        cmd.input(p).inputOptions(['-loop 1', `-t ${autoSceneDuration}`]);
       });
 
-      // Add audio
+      // Add audio last
       cmd.input(audioPath);
 
-      // Build filter_complex for xfade dissolve between each scene
-      // Each clip scaled first, then xfade chained
-      let filterParts = [];
-      let lastLabel = '';
+      // Build filter_complex
+      const filterParts = [];
 
-      // Scale all inputs
+      // Scale all video inputs
       for (let i = 0; i < n; i++) {
-        filterParts.push(`[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v${i}]`);
+        filterParts.push(
+          `[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,` +
+          `pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v${i}]`
+        );
       }
 
-      // Chain xfade dissolve transitions
+      // Chain xfade between each pair
       if (n === 1) {
-        lastLabel = 'v0';
+        // Single image — just rename label
+        filterParts.push(`[v0]null[vout]`);
       } else {
         for (let i = 0; i < n - 1; i++) {
-          const inputA = i === 0 ? `[v0]` : `[xf${i - 1}]`;
+          const inputA = i === 0 ? '[v0]' : `[xf${i - 1}]`;
           const inputB = `[v${i + 1}]`;
-          const outputLabel = i === n - 2 ? 'vout' : `xf${i}`;
-          const offset = (autoSceneDuration - fadeDuration) * (i + 1) + fadeDuration * i;
-          filterParts.push(`${inputA}${inputB}xfade=transition=dissolve:duration=${fadeDuration}:offset=${offset}[${outputLabel}]`);
+          const outLabel = i === n - 2 ? 'vout' : `xf${i}`;
+          // offset = time when this transition starts
+          const offset = (autoSceneDuration - fadeDuration) * (i + 1) - fadeDuration * i;
+          filterParts.push(
+            `${inputA}${inputB}xfade=transition=dissolve:duration=${fadeDuration}:offset=${offset}[${outLabel}]`
+          );
         }
-        lastLabel = 'vout';
       }
 
       const filterComplex = filterParts.join(';');
+      console.log(`[${jobId}] filter_complex built with ${filterParts.length} parts`);
 
       cmd
         .complexFilter(filterComplex)
         .outputOptions([
-          `-map [${lastLabel}]`,
+          `-map [vout]`,
           `-map ${n}:a`,
           '-c:v libx264',
           '-preset fast',
@@ -262,7 +183,7 @@ app.post('/assemble-video', async (req, res) => {
           '-movflags +faststart'
         ])
         .output(outputPath)
-        .on('start', (cmdLine) => console.log(`[${jobId}] FFmpeg started`))
+        .on('start', () => console.log(`[${jobId}] FFmpeg started`))
         .on('progress', p => console.log(`[${jobId}] Progress: ${Math.round(p.percent || 0)}%`))
         .on('end', () => { console.log(`[${jobId}] FFmpeg done!`); resolve(); })
         .on('error', (err) => { console.error(`[${jobId}] FFmpeg error:`, err.message); reject(err); })
@@ -284,7 +205,7 @@ app.post('/assemble-video', async (req, res) => {
       video_size_mb: videoSizeMb,
       audio_duration_seconds: Math.round(audioDuration),
       scene_duration_seconds: autoSceneDuration,
-      total_video_seconds: autoSceneDuration * imagePaths.length,
+      total_video_seconds: autoSceneDuration * n,
       video_base64: videoBase64,
       message: 'Video assembled successfully!'
     });
@@ -300,6 +221,4 @@ app.listen(PORT, () => {
   console.log(`FFmpeg Video Worker running on port ${PORT}`);
   console.log(`Health check: GET /`);
   console.log(`Assemble video: POST /assemble-video`);
-  console.log(`Generate thumbnail: POST /generate-thumbnail`);
-  console.log(`Upload thumbnail: POST /upload-thumbnail`);
 });
