@@ -30,14 +30,15 @@ app.post('/generate-thumbnail', async (req, res) => {
   if (!title) return res.status(400).json({ error: 'Missing title' });
 
   // Build an attractive thumbnail prompt
-  const prompt = `Children's YouTube thumbnail, magical bedtime story illustration, 
-    title: "${title}", 
-    characters: ${characters || 'cute animal characters'}, 
-    setting: ${setting || 'magical dreamland'}, 
-    dreamy glowing colors, sparkles, stars, moonlight, 
-    big expressive eyes, adorable, warm cozy atmosphere, 
-    professional digital art, vibrant, eye-catching, 
-    16:9 widescreen, high quality, kawaii style`;
+  const prompt = `3D rendered children's YouTube thumbnail, Pixar Disney style 3D animation, 
+    bedtime story: "${title}", 
+    ${description ? `story about: "${description}",` : ''}
+    cute 3D cartoon characters, magical glowing moonlight, 
+    dreamy bedroom or fantasy landscape background, 
+    sparkles and stars, soft warm lighting, 
+    bold colorful text space at bottom, 
+    ultra high quality 3D render, cinematic lighting, 
+    professional YouTube thumbnail, 16:9 aspect ratio`;
 
   const encodedPrompt = encodeURIComponent(prompt.trim());
   const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1280&height=720&nologo=true&seed=${Date.now()}`;
