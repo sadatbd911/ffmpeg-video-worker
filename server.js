@@ -2,6 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
@@ -91,67 +92,57 @@ app.post('/assemble-video', async (req, res) => {
 
     const n = imagePaths.length;
     const fadeDuration = 1;
-    // Scene duration must be at least fadeDuration * 3 to keep offsets valid
     const autoSceneDuration = Math.max(audioDuration / n, fadeDuration * 3);
     console.log(`[${jobId}] ${n} scenes x ${autoSceneDuration.toFixed(2)}s, fade ${fadeDuration}s`);
 
     const outputPath = path.join(jobDir, 'output.mp4');
+    const ffmpegBin = ffmpegInstaller.path;
 
-    if (n === 1) {
-      // Single image — no xfade
-      await new Promise((resolve, reject) => {
-        ffmpeg()
-          .input(imagePaths[0]).inputOptions(['-loop 1', `-t ${audioDuration}`])
-          .input(audioPath)
-          .outputOptions([
-            '-c:v libx264', '-preset fast', '-crf 23', '-pix_fmt yuv420p',
-            '-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1',
-            '-c:a aac', '-b:a 128k', '-shortest', '-movflags +faststart'
-          ])
-          .output(outputPath)
-          .on('end', resolve).on('error', reject).run();
-      });
+    // Build ffmpeg command as raw string — most reliable approach
+    // Each image as separate -loop 1 -t N -i input
+    let inputArgs = [];
+    imagePaths.forEach(p => {
+      inputArgs.push(`-loop 1 -t ${autoSceneDuration} -i "${p}"`);
+    });
+    inputArgs.push(`-i "${audioPath}"`);
 
-    } else {
-      // xfade dissolve
-      await new Promise((resolve, reject) => {
-        const cmd = ffmpeg();
-        imagePaths.forEach(p => cmd.input(p).inputOptions(['-loop 1', `-t ${autoSceneDuration}`]));
-        cmd.input(audioPath);
-
-        const filters = [];
-        // Scale all inputs
-        for (let i = 0; i < n; i++) {
-          filters.push(
-            `[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,` +
-            `pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v${i}]`
-          );
-        }
-        // xfade chain: offset = (sceneDur - fadeDur) * (i+1)
-        for (let i = 0; i < n - 1; i++) {
-          const inA = i === 0 ? `[v0]` : `[xf${i-1}]`;
-          const inB = `[v${i+1}]`;
-          const outLabel = i === n - 2 ? `vout` : `xf${i}`;
-          const offset = (autoSceneDuration - fadeDuration) * (i + 1);
-          console.log(`[${jobId}] xfade[${i}] offset=${offset.toFixed(3)}`);
-          filters.push(`${inA}${inB}xfade=transition=dissolve:duration=${fadeDuration}:offset=${offset.toFixed(3)}[${outLabel}]`);
-        }
-
-        cmd
-          .complexFilter(filters)
-          .outputOptions([
-            `-map [vout]`, `-map ${n}:a`,
-            '-c:v libx264', '-preset fast', '-crf 23',
-            '-c:a aac', '-b:a 128k', '-shortest', '-movflags +faststart'
-          ])
-          .output(outputPath)
-          .on('start', () => console.log(`[${jobId}] FFmpeg started`))
-          .on('progress', p => console.log(`[${jobId}] ${Math.round(p.percent||0)}%`))
-          .on('end', () => { console.log(`[${jobId}] Done!`); resolve(); })
-          .on('error', err => { console.error(`[${jobId}] Error:`, err.message); reject(err); })
-          .run();
-      });
+    // Build filter_complex string
+    let fc = '';
+    // Scale all
+    for (let i = 0; i < n; i++) {
+      fc += `[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v${i}];`;
     }
+    // xfade chain
+    if (n === 1) {
+      fc += `[v0]copy[vout]`;
+    } else {
+      for (let i = 0; i < n - 1; i++) {
+        const inA = i === 0 ? `[v0]` : `[xf${i-1}]`;
+        const inB = `[v${i+1}]`;
+        const outLabel = i === n - 2 ? `[vout]` : `[xf${i}]`;
+        const offset = (autoSceneDuration - fadeDuration) * (i + 1);
+        fc += `${inA}${inB}xfade=transition=dissolve:duration=${fadeDuration}:offset=${offset.toFixed(3)}${outLabel}`;
+        if (i < n - 2) fc += ';';
+      }
+    }
+
+    console.log(`[${jobId}] filter_complex length: ${fc.length} chars`);
+
+    const cmd = `${ffmpegBin} ${inputArgs.join(' ')} -filter_complex "${fc.replace(/"/g, '\\"')}" -map "[vout]" -map "${n}:a" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
+
+    console.log(`[${jobId}] Running FFmpeg...`);
+    await new Promise((resolve, reject) => {
+      const { exec } = require('child_process');
+      exec(cmd, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+        if (err) {
+          console.error(`[${jobId}] FFmpeg error:`, stderr.slice(-500));
+          reject(new Error(stderr.slice(-300)));
+        } else {
+          console.log(`[${jobId}] FFmpeg done!`);
+          resolve();
+        }
+      });
+    });
 
     const videoBuffer = fs.readFileSync(outputPath);
     const videoBase64 = videoBuffer.toString('base64');
