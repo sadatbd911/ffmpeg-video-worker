@@ -25,7 +25,7 @@ app.post('/assemble-video', async (req, res) => {
   console.log('Request received!');
   console.log('Body keys:', Object.keys(req.body));
 
-  const { story_id, title, scene_duration = 5 } = req.body;
+  const { story_id, title } = req.body;
   let audio_url = req.body.audio_url;
   let audio_base64 = req.body.audio_base64;
   let image_urls = req.body.image_urls;
@@ -68,26 +68,21 @@ app.post('/assemble-video', async (req, res) => {
     try {
       audioDuration = await new Promise((resolve) => {
         ffmpeg.ffprobe(audioPath, (err, metadata) => {
-          if (err) {
-            console.log(`[${jobId}] ffprobe error: ${err.message}`);
-            resolve(0);
-          } else {
+          if (err) { console.log(`[${jobId}] ffprobe error: ${err.message}`); resolve(0); }
+          else {
             const dur = metadata.format.duration;
             console.log(`[${jobId}] ffprobe duration: ${dur}s`);
             resolve(dur || 0);
           }
         });
       });
-    } catch(e) {
-      console.log(`[${jobId}] ffprobe failed: ${e.message}`);
-    }
+    } catch(e) { console.log(`[${jobId}] ffprobe failed: ${e.message}`); }
 
     if (!audioDuration || audioDuration <= 0) {
       const audioSize = fs.statSync(audioPath).size;
       audioDuration = Math.round(audioSize / 16000);
       console.log(`[${jobId}] Size-based duration estimate: ${audioDuration}s`);
     }
-
     console.log(`[${jobId}] Final audio duration: ${audioDuration}s`);
 
     // Step 3: Save images
@@ -101,15 +96,15 @@ app.post('/assemble-video', async (req, res) => {
         if (image_base64_list && image_base64_list[i]) {
           const imgBuffer = Buffer.from(image_base64_list[i], 'base64');
           fs.writeFileSync(imgPath, imgBuffer);
-          console.log(`[${jobId}] Image ${i + 1}/${totalImages} saved from base64 (${(imgBuffer.length / 1024).toFixed(0)}KB)`);
+          console.log(`[${jobId}] Image ${i+1}/${totalImages} saved (${(imgBuffer.length/1024).toFixed(0)}KB)`);
         } else if (image_urls && image_urls[i]) {
           const imgResp = await axios.get(image_urls[i], { responseType: 'arraybuffer', timeout: 30000 });
           fs.writeFileSync(imgPath, Buffer.from(imgResp.data));
-          console.log(`[${jobId}] Image ${i + 1}/${totalImages} downloaded from URL`);
+          console.log(`[${jobId}] Image ${i+1}/${totalImages} downloaded`);
         }
         imagePaths.push(imgPath);
       } catch (err) {
-        console.log(`[${jobId}] Image ${i + 1} failed: ${err.message}`);
+        console.log(`[${jobId}] Image ${i+1} failed: ${err.message}`);
         if (imagePaths.length > 0) imagePaths.push(imagePaths[0]);
       }
       await new Promise(r => setTimeout(r, 100));
@@ -117,83 +112,88 @@ app.post('/assemble-video', async (req, res) => {
 
     if (imagePaths.length === 0) throw new Error('No images downloaded');
 
-    // Step 4: Calculate durations
-    const fadeDuration = 1; // 1 second dissolve
     const n = imagePaths.length;
+    const fadeDuration = 1;
     const autoSceneDuration = Math.max(Math.ceil(audioDuration / n), fadeDuration + 2);
-    console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s x ${n} scenes, fade: ${fadeDuration}s`);
+    console.log(`[${jobId}] ${n} scenes x ${autoSceneDuration}s, fade ${fadeDuration}s`);
 
-    // Step 5: FFmpeg with xfade dissolve
-    console.log(`[${jobId}] Running FFmpeg with dissolve transitions...`);
     const outputPath = path.join(jobDir, 'output.mp4');
 
-    await new Promise((resolve, reject) => {
-      const cmd = ffmpeg();
-
-      // Add each image as looped input for autoSceneDuration
-      imagePaths.forEach(p => {
-        cmd.input(p).inputOptions(['-loop 1', `-t ${autoSceneDuration}`]);
+    if (n === 1) {
+      // Single image — simple approach, no xfade needed
+      console.log(`[${jobId}] Single image — simple concat mode`);
+      await new Promise((resolve, reject) => {
+        ffmpeg()
+          .input(imagePaths[0]).inputOptions(['-loop 1', `-t ${audioDuration}`])
+          .input(audioPath)
+          .outputOptions([
+            '-c:v libx264', '-preset fast', '-crf 23', '-pix_fmt yuv420p',
+            '-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1',
+            '-c:a aac', '-b:a 128k', '-shortest', '-movflags +faststart'
+          ])
+          .output(outputPath)
+          .on('end', resolve)
+          .on('error', reject)
+          .run();
       });
 
-      // Add audio last
-      cmd.input(audioPath);
+    } else {
+      // Multiple images — xfade dissolve
+      console.log(`[${jobId}] Running FFmpeg xfade dissolve...`);
+      await new Promise((resolve, reject) => {
+        const cmd = ffmpeg();
 
-      // Build filter_complex
-      const filterParts = [];
+        // Each image as looped input
+        imagePaths.forEach(p => {
+          cmd.input(p).inputOptions(['-loop 1', `-t ${autoSceneDuration}`]);
+        });
+        cmd.input(audioPath);
 
-      // Scale all video inputs
-      for (let i = 0; i < n; i++) {
-        filterParts.push(
-          `[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,` +
-          `pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v${i}]`
-        );
-      }
+        // Build filter_complex
+        const filters = [];
 
-      // Chain xfade between each pair
-      if (n === 1) {
-        // Single image — just rename label
-        filterParts.push(`[v0]null[vout]`);
-      } else {
-        for (let i = 0; i < n - 1; i++) {
-          const inputA = i === 0 ? '[v0]' : `[xf${i - 1}]`;
-          const inputB = `[v${i + 1}]`;
-          const outLabel = i === n - 2 ? 'vout' : `xf${i}`;
-          // offset = time when this transition starts
-          const offset = (autoSceneDuration - fadeDuration) * (i + 1) - fadeDuration * i;
-          filterParts.push(
-            `${inputA}${inputB}xfade=transition=dissolve:duration=${fadeDuration}:offset=${offset}[${outLabel}]`
+        // Scale each input
+        for (let i = 0; i < n; i++) {
+          filters.push(
+            `[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,` +
+            `pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v${i}]`
           );
         }
-      }
 
-      const filterComplex = filterParts.join(';');
-      console.log(`[${jobId}] filter_complex built with ${filterParts.length} parts`);
+        // Chain xfade
+        for (let i = 0; i < n - 1; i++) {
+          const inA = i === 0 ? `[v0]` : `[xf${i-1}]`;
+          const inB = `[v${i+1}]`;
+          const out = i === n - 2 ? `[vout]` : `[xf${i}]`;
+          const offset = (autoSceneDuration - fadeDuration) * (i + 1) - fadeDuration * i;
+          filters.push(
+            `${inA}${inB}xfade=transition=dissolve:duration=${fadeDuration}:offset=${offset}${out}`
+          );
+        }
 
-      cmd
-        .complexFilter(filterComplex)
-        .outputOptions([
-          `-map [vout]`,
-          `-map ${n}:a`,
-          '-c:v libx264',
-          '-preset fast',
-          '-crf 23',
-          '-c:a aac',
-          '-b:a 128k',
-          '-shortest',
-          '-movflags +faststart'
-        ])
-        .output(outputPath)
-        .on('start', () => console.log(`[${jobId}] FFmpeg started`))
-        .on('progress', p => console.log(`[${jobId}] Progress: ${Math.round(p.percent || 0)}%`))
-        .on('end', () => { console.log(`[${jobId}] FFmpeg done!`); resolve(); })
-        .on('error', (err) => { console.error(`[${jobId}] FFmpeg error:`, err.message); reject(err); })
-        .run();
-    });
+        console.log(`[${jobId}] filter_complex (${filters.length} parts)`);
+
+        cmd
+          .complexFilter(filters)
+          .outputOptions([
+            `-map [vout]`,
+            `-map ${n}:a`,
+            '-c:v libx264', '-preset fast', '-crf 23',
+            '-c:a aac', '-b:a 128k',
+            '-shortest', '-movflags +faststart'
+          ])
+          .output(outputPath)
+          .on('start', () => console.log(`[${jobId}] FFmpeg started`))
+          .on('progress', p => console.log(`[${jobId}] Progress: ${Math.round(p.percent||0)}%`))
+          .on('end', () => { console.log(`[${jobId}] FFmpeg done!`); resolve(); })
+          .on('error', (err) => { console.error(`[${jobId}] FFmpeg error:`, err.message); reject(err); })
+          .run();
+      });
+    }
 
     const videoBuffer = fs.readFileSync(outputPath);
     const videoBase64 = videoBuffer.toString('base64');
     const videoSizeMb = (videoBuffer.length / 1024 / 1024).toFixed(2);
-
     console.log(`[${jobId}] Done! Size: ${videoSizeMb}MB`);
 
     fs.rmSync(jobDir, { recursive: true, force: true });
