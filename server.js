@@ -30,15 +30,14 @@ app.post('/generate-thumbnail', async (req, res) => {
   if (!title) return res.status(400).json({ error: 'Missing title' });
 
   // Build an attractive thumbnail prompt
-  const prompt = `3D rendered children's YouTube thumbnail, Pixar Disney style 3D animation, 
-    bedtime story: "${title}", 
-    ${description ? `story about: "${description}",` : ''}
-    cute 3D cartoon characters, magical glowing moonlight, 
-    dreamy bedroom or fantasy landscape background, 
-    sparkles and stars, soft warm lighting, 
-    bold colorful text space at bottom, 
-    ultra high quality 3D render, cinematic lighting, 
-    professional YouTube thumbnail, 16:9 aspect ratio`;
+  const prompt = `Children's YouTube thumbnail, magical bedtime story illustration, 
+    title: "${title}", 
+    characters: ${characters || 'cute animal characters'}, 
+    setting: ${setting || 'magical dreamland'}, 
+    dreamy glowing colors, sparkles, stars, moonlight, 
+    big expressive eyes, adorable, warm cozy atmosphere, 
+    professional digital art, vibrant, eye-catching, 
+    16:9 widescreen, high quality, kawaii style`;
 
   const encodedPrompt = encodeURIComponent(prompt.trim());
   const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1280&height=720&nologo=true&seed=${Date.now()}`;
@@ -204,37 +203,69 @@ app.post('/assemble-video', async (req, res) => {
 
     if (imagePaths.length === 0) throw new Error('No images downloaded');
 
+    const fadeDuration = 1; // seconds for crossfade
     const autoSceneDuration = Math.ceil(audioDuration / imagePaths.length);
-    console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s × ${imagePaths.length} scenes`);
+    console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s × ${imagePaths.length} scenes, fade: ${fadeDuration}s`);
 
-    const listPath = path.join(jobDir, 'images.txt');
-    let listContent = imagePaths.map(p => `file '${p}'\nduration ${autoSceneDuration}`).join('\n');
-    listContent += `\nfile '${imagePaths[imagePaths.length - 1]}'`;
-    fs.writeFileSync(listPath, listContent);
-
-    console.log(`[${jobId}] Running FFmpeg...`);
+    console.log(`[${jobId}] Running FFmpeg with xfade dissolve...`);
     const outputPath = path.join(jobDir, 'output.mp4');
 
     await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(listPath)
-        .inputOptions(['-f concat', '-safe 0'])
-        .input(audioPath)
+      const n = imagePaths.length;
+      const cmd = ffmpeg();
+
+      // Add all image inputs, each held for autoSceneDuration
+      imagePaths.forEach(p => {
+        cmd.input(p).inputOptions([`-loop 1`, `-t ${autoSceneDuration}`]);
+      });
+
+      // Add audio
+      cmd.input(audioPath);
+
+      // Build filter_complex for xfade dissolve between each scene
+      // Each clip scaled first, then xfade chained
+      let filterParts = [];
+      let lastLabel = '';
+
+      // Scale all inputs
+      for (let i = 0; i < n; i++) {
+        filterParts.push(`[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v${i}]`);
+      }
+
+      // Chain xfade dissolve transitions
+      if (n === 1) {
+        lastLabel = 'v0';
+      } else {
+        for (let i = 0; i < n - 1; i++) {
+          const inputA = i === 0 ? `[v0]` : `[xf${i - 1}]`;
+          const inputB = `[v${i + 1}]`;
+          const outputLabel = i === n - 2 ? 'vout' : `xf${i}`;
+          const offset = (autoSceneDuration - fadeDuration) * (i + 1) + fadeDuration * i;
+          filterParts.push(`${inputA}${inputB}xfade=transition=dissolve:duration=${fadeDuration}:offset=${offset}[${outputLabel}]`);
+        }
+        lastLabel = 'vout';
+      }
+
+      const filterComplex = filterParts.join(';');
+
+      cmd
+        .complexFilter(filterComplex)
         .outputOptions([
+          `-map [${lastLabel}]`,
+          `-map ${n}:a`,
           '-c:v libx264',
           '-preset fast',
           '-crf 23',
-          '-pix_fmt yuv420p',
-          '-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1',
           '-c:a aac',
           '-b:a 128k',
+          '-shortest',
           '-movflags +faststart'
         ])
         .output(outputPath)
-        .on('start', () => console.log(`[${jobId}] FFmpeg started`))
+        .on('start', (cmdLine) => console.log(`[${jobId}] FFmpeg started`))
         .on('progress', p => console.log(`[${jobId}] Progress: ${Math.round(p.percent || 0)}%`))
         .on('end', () => { console.log(`[${jobId}] FFmpeg done!`); resolve(); })
-        .on('error', (err) => { reject(err); })
+        .on('error', (err) => { console.error(`[${jobId}] FFmpeg error:`, err.message); reject(err); })
         .run();
     });
 
