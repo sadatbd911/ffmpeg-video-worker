@@ -21,6 +21,95 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'FFmpeg Video Worker is running!' });
 });
 
+// ─────────────────────────────────────────────
+// NEW: Generate Thumbnail via Pollinations AI
+// ─────────────────────────────────────────────
+app.post('/generate-thumbnail', async (req, res) => {
+  const { title, description, characters, setting } = req.body;
+
+  if (!title) return res.status(400).json({ error: 'Missing title' });
+
+  // Build an attractive thumbnail prompt
+  const prompt = `Children's YouTube thumbnail, magical bedtime story illustration, 
+    title: "${title}", 
+    characters: ${characters || 'cute animal characters'}, 
+    setting: ${setting || 'magical dreamland'}, 
+    dreamy glowing colors, sparkles, stars, moonlight, 
+    big expressive eyes, adorable, warm cozy atmosphere, 
+    professional digital art, vibrant, eye-catching, 
+    16:9 widescreen, high quality, kawaii style`;
+
+  const encodedPrompt = encodeURIComponent(prompt.trim());
+  const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1280&height=720&nologo=true&seed=${Date.now()}`;
+
+  try {
+    console.log(`[thumbnail] Generating for: ${title}`);
+    const imgResp = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 60000 });
+    const imgBase64 = Buffer.from(imgResp.data).toString('base64');
+    const imgBuffer = Buffer.from(imgResp.data);
+
+    console.log(`[thumbnail] Generated: ${(imgBuffer.length / 1024).toFixed(0)}KB`);
+
+    res.json({
+      success: true,
+      thumbnail_base64: imgBase64,
+      thumbnail_size_kb: (imgBuffer.length / 1024).toFixed(0),
+      prompt_used: prompt.trim(),
+      message: 'Thumbnail generated successfully!'
+    });
+
+  } catch (err) {
+    console.error('[thumbnail] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// NEW: Upload Thumbnail to YouTube
+// ─────────────────────────────────────────────
+app.post('/upload-thumbnail', async (req, res) => {
+  const { video_id, thumbnail_base64, access_token } = req.body;
+
+  if (!video_id) return res.status(400).json({ error: 'Missing video_id' });
+  if (!thumbnail_base64) return res.status(400).json({ error: 'Missing thumbnail_base64' });
+  if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
+
+  try {
+    console.log(`[upload-thumbnail] Uploading for video: ${video_id}`);
+
+    const imgBuffer = Buffer.from(thumbnail_base64, 'base64');
+
+    const response = await axios.post(
+      `https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${video_id}&uploadType=media`,
+      imgBuffer,
+      {
+        headers: {
+          'Authorization': `Bearer ${access_token}`,
+          'Content-Type': 'image/jpeg',
+          'Content-Length': imgBuffer.length
+        },
+        timeout: 60000
+      }
+    );
+
+    console.log(`[upload-thumbnail] Success for video: ${video_id}`);
+    res.json({
+      success: true,
+      video_id: video_id,
+      youtube_response: response.data,
+      message: 'Thumbnail uploaded to YouTube successfully!'
+    });
+
+  } catch (err) {
+    const errMsg = err.response?.data || err.message;
+    console.error('[upload-thumbnail] Error:', JSON.stringify(errMsg));
+    res.status(500).json({ error: errMsg });
+  }
+});
+
+// ─────────────────────────────────────────────
+// EXISTING: Assemble Video
+// ─────────────────────────────────────────────
 app.post('/assemble-video', async (req, res) => {
   console.log('Request received!');
   console.log('Body keys:', Object.keys(req.body));
@@ -52,7 +141,6 @@ app.post('/assemble-video', async (req, res) => {
   console.log(`[${jobId}] Starting for: ${title}`);
 
   try {
-    // Step 1: Save audio
     const audioPath = path.join(jobDir, 'audio.mp3');
     if (audio_base64) {
       const audioBuffer = Buffer.from(audio_base64, 'base64');
@@ -63,7 +151,6 @@ app.post('/assemble-video', async (req, res) => {
       fs.writeFileSync(audioPath, Buffer.from(audioResp.data));
     }
 
-    // Step 2: Detect audio duration
     let audioDuration = 0;
     try {
       audioDuration = await new Promise((resolve) => {
@@ -90,7 +177,6 @@ app.post('/assemble-video', async (req, res) => {
 
     console.log(`[${jobId}] Final audio duration: ${audioDuration}s`);
 
-    // Step 3: Save images (supports both base64 and URLs)
     const totalImages = image_base64_list ? image_base64_list.length : image_urls.length;
     console.log(`[${jobId}] Processing ${totalImages} images...`);
 
@@ -99,12 +185,10 @@ app.post('/assemble-video', async (req, res) => {
       const imgPath = path.join(jobDir, `scene_${String(i + 1).padStart(2, '0')}.jpg`);
       try {
         if (image_base64_list && image_base64_list[i]) {
-          // Save from base64
           const imgBuffer = Buffer.from(image_base64_list[i], 'base64');
           fs.writeFileSync(imgPath, imgBuffer);
           console.log(`[${jobId}] Image ${i + 1}/${totalImages} saved from base64 (${(imgBuffer.length / 1024).toFixed(0)}KB)`);
         } else if (image_urls && image_urls[i]) {
-          // Download from URL
           const imgResp = await axios.get(image_urls[i], { responseType: 'arraybuffer', timeout: 30000 });
           fs.writeFileSync(imgPath, Buffer.from(imgResp.data));
           console.log(`[${jobId}] Image ${i + 1}/${totalImages} downloaded from URL`);
@@ -119,17 +203,14 @@ app.post('/assemble-video', async (req, res) => {
 
     if (imagePaths.length === 0) throw new Error('No images downloaded');
 
-    // Step 4: Calculate scene duration
     const autoSceneDuration = Math.ceil(audioDuration / imagePaths.length);
     console.log(`[${jobId}] Scene duration: ${autoSceneDuration}s × ${imagePaths.length} scenes`);
 
-    // Step 5: Create image list
     const listPath = path.join(jobDir, 'images.txt');
     let listContent = imagePaths.map(p => `file '${p}'\nduration ${autoSceneDuration}`).join('\n');
     listContent += `\nfile '${imagePaths[imagePaths.length - 1]}'`;
     fs.writeFileSync(listPath, listContent);
 
-    // Step 6: FFmpeg assembly
     console.log(`[${jobId}] Running FFmpeg...`);
     const outputPath = path.join(jobDir, 'output.mp4');
 
@@ -187,4 +268,6 @@ app.listen(PORT, () => {
   console.log(`FFmpeg Video Worker running on port ${PORT}`);
   console.log(`Health check: GET /`);
   console.log(`Assemble video: POST /assemble-video`);
+  console.log(`Generate thumbnail: POST /generate-thumbnail`);
+  console.log(`Upload thumbnail: POST /upload-thumbnail`);
 });
