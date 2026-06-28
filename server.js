@@ -75,14 +75,20 @@ app.post('/assemble-video', async (req, res) => {
       ? path.join(MUSIC_DIR, MUSIC_FILES[music_mood])
       : null;
 
+    console.log(`[${jobId}] Music dir: ${MUSIC_DIR}`);
+    console.log(`[${jobId}] Music file path: ${musicFile}`);
+    console.log(`[${jobId}] Music file exists: ${musicFile ? fs.existsSync(musicFile) : 'no path'}`);
+
     if (musicFile && fs.existsSync(musicFile)) {
       console.log(`[${jobId}] Mixing music: ${music_mood}`);
       const mixedPath = path.join(jobDir, 'audio.mp3');
       await new Promise((resolve) => {
         const mixCmd = `${ffmpegInstaller.path} -i "${voicePath}" -stream_loop -1 -i "${musicFile}" -filter_complex "[0:a]volume=1.0[voice];[1:a]volume=0.20[music];[voice][music]amix=inputs=2:duration=first:dropout_transition=2[aout]" -map "[aout]" -c:a aac -b:a 128k "${mixedPath}" -y`;
-        exec(mixCmd, { maxBuffer: 1024 * 1024 * 50 }, (err) => {
+        console.log(`[${jobId}] Mix cmd: ${mixCmd.slice(0, 200)}`);
+        exec(mixCmd, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
           if (err) {
-            console.log(`[${jobId}] Music mix failed, voice only`);
+            console.log(`[${jobId}] Music mix failed: ${err.message}`);
+            console.log(`[${jobId}] Stderr: ${stderr ? stderr.slice(0, 300) : 'none'}`);
             audioPath = voicePath;
           } else {
             console.log(`[${jobId}] Music mixed!`);
@@ -94,7 +100,6 @@ app.post('/assemble-video', async (req, res) => {
     } else {
       console.log(`[${jobId}] No music for mood: ${music_mood}`);
     }
-
     // Step 3: Get audio duration
     let audioDuration = 0;
     try {
