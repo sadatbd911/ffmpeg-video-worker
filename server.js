@@ -146,7 +146,7 @@ app.post('/assemble-video', async (req, res) => {
 
     console.log(`[${jobId}] Running FFmpeg concat...`);
     await new Promise((resolve, reject) => {
-      const cmd = `${ffmpegInstaller.path} -f concat -safe 0 -i "${listPath}" -i "${audioPath}" -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1" -c:a aac -b:a 128k -shortest -movflags +faststart -map 0:v:0 -map 1:a:0 "${outputPath}" -y`;
+    const cmd = `${ffmpegInstaller.path} -f concat -safe 0 -i "${listPath}" -i "${audioPath}" -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1" -c:a aac -b:a 128k -shortest -movflags +faststart -map 0:v:0 -map 1:a:0 "${outputPath}" -y`;  
       exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
         if (err) {
           console.error(`[${jobId}] FFmpeg error:`, stderr.slice(-500));
