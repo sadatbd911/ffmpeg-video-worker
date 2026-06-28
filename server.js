@@ -19,7 +19,6 @@ const MUSIC_DIR = path.join(__dirname, 'music');
 
 if (!fs.existsSync(TMP)) fs.mkdirSync(TMP, { recursive: true });
 
-// Music mood mapping
 const MUSIC_FILES = {
   'soft_lullaby': 'soft_lullaby.mp3',
   'adventure': 'adventure.mp3',
@@ -30,6 +29,13 @@ const MUSIC_FILES = {
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'FFmpeg Video Worker is running!' });
+});
+
+// Check FFmpeg version and xfade support
+app.get('/ffmpeg-info', (req, res) => {
+  exec(`${ffmpegInstaller.path} -version`, (err, stdout) => {
+    res.json({ version: stdout.slice(0, 200) });
+  });
 });
 
 app.post('/assemble-video', async (req, res) => {
@@ -51,7 +57,7 @@ app.post('/assemble-video', async (req, res) => {
   const jobId = story_id || Date.now().toString();
   const jobDir = path.join(TMP, jobId);
   fs.mkdirSync(jobDir, { recursive: true });
-  console.log(`[${jobId}] Starting: ${title}, music_mood: ${music_mood}`);
+  console.log(`[${jobId}] Starting: ${title}, music: ${music_mood}`);
 
   try {
     // Step 1: Save voice audio
@@ -63,7 +69,7 @@ app.post('/assemble-video', async (req, res) => {
       fs.writeFileSync(voicePath, Buffer.from(r.data));
     }
 
-    // Step 2: Mix music with voice (if music_mood provided)
+    // Step 2: Mix music with voice
     let audioPath = voicePath;
     const musicFile = music_mood && MUSIC_FILES[music_mood]
       ? path.join(MUSIC_DIR, MUSIC_FILES[music_mood])
@@ -72,26 +78,21 @@ app.post('/assemble-video', async (req, res) => {
     if (musicFile && fs.existsSync(musicFile)) {
       console.log(`[${jobId}] Mixing music: ${music_mood}`);
       const mixedPath = path.join(jobDir, 'audio.mp3');
-
-      await new Promise((resolve, reject) => {
-        // Mix: voice 100% + music 20% looped, cut to voice length
+      await new Promise((resolve) => {
         const mixCmd = `${ffmpegInstaller.path} -i "${voicePath}" -stream_loop -1 -i "${musicFile}" -filter_complex "[0:a]volume=1.0[voice];[1:a]volume=0.20[music];[voice][music]amix=inputs=2:duration=first:dropout_transition=2[aout]" -map "[aout]" -c:a aac -b:a 128k "${mixedPath}" -y`;
-
-        exec(mixCmd, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
+        exec(mixCmd, { maxBuffer: 1024 * 1024 * 50 }, (err) => {
           if (err) {
-            console.log(`[${jobId}] Music mix failed, using voice only: ${err.message}`);
-            audioPath = voicePath; // fallback to voice only
-            resolve();
+            console.log(`[${jobId}] Music mix failed, voice only`);
+            audioPath = voicePath;
           } else {
-            console.log(`[${jobId}] Music mixed successfully!`);
+            console.log(`[${jobId}] Music mixed!`);
             audioPath = mixedPath;
-            resolve();
           }
+          resolve();
         });
       });
     } else {
-      console.log(`[${jobId}] No music file found for mood: ${music_mood}, using voice only`);
-      audioPath = voicePath;
+      console.log(`[${jobId}] No music for mood: ${music_mood}`);
     }
 
     // Step 3: Get audio duration
@@ -132,54 +133,30 @@ app.post('/assemble-video', async (req, res) => {
     if (!imagePaths.length) throw new Error('No images');
 
     const n = imagePaths.length;
-    const fadeDuration = 1;
-    const autoSceneDuration = Math.max(audioDuration / n, fadeDuration * 3);
-    console.log(`[${jobId}] ${n} scenes x ${autoSceneDuration.toFixed(2)}s, fade ${fadeDuration}s`);
+    const autoSceneDuration = Math.ceil(audioDuration / n);
+    console.log(`[${jobId}] ${n} scenes x ${autoSceneDuration}s`);
 
     const outputPath = path.join(jobDir, 'output.mp4');
 
-    if (n === 1) {
-      await new Promise((resolve, reject) => {
-        const cmd = `${ffmpegInstaller.path} -loop 1 -t ${audioDuration} -i "${imagePaths[0]}" -i "${audioPath}" -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1" -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}" -y`;
-        exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
-          if (err) reject(new Error(stderr.slice(-300)));
-          else resolve();
-        });
-      });
-    } else {
-      await new Promise((resolve, reject) => {
-        // Build input args
-        let inputArgs = imagePaths.map(p => `-loop 1 -t ${autoSceneDuration} -i "${p}"`).join(' ');
-        inputArgs += ` -i "${audioPath}"`;
+    // Use concat demuxer — simple and reliable, works on all FFmpeg versions
+    const listPath = path.join(jobDir, 'images.txt');
+    let listContent = imagePaths.map(p => `file '${p}'\nduration ${autoSceneDuration}`).join('\n');
+    listContent += `\nfile '${imagePaths[imagePaths.length - 1]}'`;
+    fs.writeFileSync(listPath, listContent);
 
-        // Build filter_complex
-        let fc = '';
-        for (let i = 0; i < n; i++) {
-          fc += `[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v${i}];`;
+    console.log(`[${jobId}] Running FFmpeg concat...`);
+    await new Promise((resolve, reject) => {
+      const cmd = `${ffmpegInstaller.path} -f concat -safe 0 -i "${listPath}" -i "${audioPath}" -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1" -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}" -y`;
+      exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
+        if (err) {
+          console.error(`[${jobId}] FFmpeg error:`, stderr.slice(-500));
+          reject(new Error(stderr.slice(-300)));
+        } else {
+          console.log(`[${jobId}] FFmpeg done!`);
+          resolve();
         }
-        for (let i = 0; i < n - 1; i++) {
-          const inA = i === 0 ? `[v0]` : `[xf${i-1}]`;
-          const inB = `[v${i+1}]`;
-          const outLabel = i === n - 2 ? `[vout]` : `[xf${i}]`;
-          const offset = (autoSceneDuration - fadeDuration) * (i + 1);
-          fc += `${inA}${inB}xfade=transition=dissolve:duration=${fadeDuration}:offset=${offset.toFixed(3)}${outLabel}`;
-          if (i < n - 2) fc += ';';
-        }
-
-        const cmd = `${ffmpegInstaller.path} ${inputArgs} -filter_complex "${fc}" -map "[vout]" -map "${n}:a" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}" -y`;
-
-        console.log(`[${jobId}] Running FFmpeg xfade dissolve...`);
-        exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
-          if (err) {
-            console.error(`[${jobId}] FFmpeg error:`, stderr.slice(-500));
-            reject(new Error(stderr.slice(-300)));
-          } else {
-            console.log(`[${jobId}] FFmpeg done!`);
-            resolve();
-          }
-        });
       });
-    }
+    });
 
     const videoBuffer = fs.readFileSync(outputPath);
     const videoBase64 = videoBuffer.toString('base64');
@@ -191,7 +168,7 @@ app.post('/assemble-video', async (req, res) => {
       success: true, job_id: jobId, title,
       video_size_mb: sizeMb,
       audio_duration_seconds: Math.round(audioDuration),
-      scene_duration_seconds: parseFloat(autoSceneDuration.toFixed(2)),
+      scene_duration_seconds: autoSceneDuration,
       music_mood: music_mood || 'none',
       video_base64: videoBase64,
       message: 'Video assembled successfully!'
