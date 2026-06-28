@@ -31,13 +31,6 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'FFmpeg Video Worker is running!' });
 });
 
-// Check FFmpeg version and xfade support
-app.get('/ffmpeg-info', (req, res) => {
-  exec(`${ffmpegInstaller.path} -version`, (err, stdout) => {
-    res.json({ version: stdout.slice(0, 200) });
-  });
-});
-
 app.post('/assemble-video', async (req, res) => {
   console.log('Request received!');
 
@@ -83,7 +76,8 @@ app.post('/assemble-video', async (req, res) => {
       console.log(`[${jobId}] Mixing music: ${music_mood}`);
       const mixedPath = path.join(jobDir, 'audio.mp3');
       await new Promise((resolve) => {
-        const mixCmd = `${ffmpegInstaller.path} -i "${voicePath}" -stream_loop -1 -i "${musicFile}" -filter_complex "[0:a]volume=1.0[voice];[1:a]volume=0.20[music];[voice][music]amix=inputs=2:duration=first:dropout_transition=2[aout]" -map "[aout]" -c:a aac -b:a 128k "${mixedPath}" -y`;
+        // aresample to normalize sample rates, libmp3lame for old FFmpeg compatibility
+        const mixCmd = `${ffmpegInstaller.path} -i "${voicePath}" -stream_loop -1 -i "${musicFile}" -filter_complex "[0:a]aresample=44100[a0];[1:a]aresample=44100[a1];[a0]volume=1.0[voice];[a1]volume=0.20[music];[voice][music]amix=inputs=2:duration=first:dropout_transition=2[aout]" -map "[aout]" -ar 44100 -ac 2 -c:a libmp3lame -b:a 128k "${mixedPath}" -y`;
         console.log(`[${jobId}] Mix cmd: ${mixCmd.slice(0, 200)}`);
         exec(mixCmd, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
           if (err) {
@@ -91,7 +85,7 @@ app.post('/assemble-video', async (req, res) => {
             console.log(`[${jobId}] Stderr: ${stderr ? stderr.slice(0, 300) : 'none'}`);
             audioPath = voicePath;
           } else {
-            console.log(`[${jobId}] Music mixed!`);
+            console.log(`[${jobId}] Music mixed successfully!`);
             audioPath = mixedPath;
           }
           resolve();
@@ -100,6 +94,7 @@ app.post('/assemble-video', async (req, res) => {
     } else {
       console.log(`[${jobId}] No music for mood: ${music_mood}`);
     }
+
     // Step 3: Get audio duration
     let audioDuration = 0;
     try {
@@ -143,7 +138,7 @@ app.post('/assemble-video', async (req, res) => {
 
     const outputPath = path.join(jobDir, 'output.mp4');
 
-    // Use concat demuxer — simple and reliable, works on all FFmpeg versions
+    // Concat demuxer — works on all FFmpeg versions
     const listPath = path.join(jobDir, 'images.txt');
     let listContent = imagePaths.map(p => `file '${p}'\nduration ${autoSceneDuration}`).join('\n');
     listContent += `\nfile '${imagePaths[imagePaths.length - 1]}'`;
